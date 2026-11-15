@@ -65,6 +65,8 @@ mechanisms from fix round 3 are kept; all pinned replies, intents,
 cache strings, the greeting, the Whisper domain prompt and the
 tracking-code format were replaced with personal-receptionist ones.
 
+Resilience (2026-11-15): after six fast /transcribe 502s with empty app logs, Groq failures log one line (endpoint, HTTP status, error-body excerpt) and 429/5xx gets one retry after ~2s, in both groq_transcribe and groq_chat.
+
 Run on the VPS via systemd (see vps-setup.sh); locally with the piper venv python.
 """
 import base64, io, json, os, re, sys, threading, time, wave
@@ -330,6 +332,41 @@ def _warm_tts_cache():
     print(f"tts cache warmed: {len(TTS_CACHE)} entries", flush=True)
 
 
+# Groq failure handling (resilience fix, 2026-11-15): a live incident
+# showed six fast /transcribe 502s in a row with NOTHING in the app
+# logs, so the Groq failure was unprovable retroactively. Every Groq
+# failure now logs one line, and 429/5xx gets one retry after ~2s.
+def _log_groq_error(endpoint, e):
+    """Log one line for a failed Groq call and stash the error-body
+    excerpt on the exception: e.read() consumes the body, so it must
+    be read exactly once, here — the HTTP handler reuses the stash
+    for the 502 JSON detail. Groq error bodies carry only error
+    type/message text; keys and request bodies are never logged."""
+    try:
+        excerpt = e.read().decode(errors="replace")[:300]
+    except Exception:
+        excerpt = ""
+    e.groq_body_text = excerpt
+    print(f"groq {endpoint}: HTTP {e.code} {excerpt}", flush=True)
+
+
+def _groq_detail(e):
+    """Error-body excerpt for the 502 JSON: prefer the stash left by
+    _log_groq_error; fall back to reading the body for HTTPError
+    raised outside groq_transcribe/groq_chat."""
+    detail = getattr(e, "groq_body_text", None)
+    if detail is None:
+        try:
+            detail = e.read().decode(errors="replace")[:300]
+        except Exception:
+            detail = ""
+    return detail
+
+
+def _groq_retryable(code):
+    return code == 429 or 500 <= code <= 599
+
+
 def groq_transcribe(audio_bytes, ctype):
     boundary = "----livecall" + str(int(time.time() * 1000))
     body = b""
@@ -362,13 +399,30 @@ def groq_transcribe(audio_bytes, ctype):
     body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
              f"filename=\"mic.{ext}\"\r\nContent-Type: {ctype}\r\n\r\n").encode()
     body += audio_bytes + f"\r\n--{boundary}--\r\n".encode()
-    req = urlreq.Request(f"{GROQ_BASE}/audio/transcriptions", data=body, method="POST")
-    req.add_header("User-Agent", GROQ_UA)
-    if not apply_groq_auth(req):
-        raise RuntimeError("no Groq credential available")
-    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
-    with urlreq.urlopen(req, timeout=60) as r:
-        return json.loads(r.read()).get("text", "").strip()
+    # One retry on 429/5xx: Groq burst-limits are transient (seen live
+    # 2026-11-15: six fast 502s, then 200 again minutes later). The
+    # request is rebuilt per attempt so urlopen never reuses a request
+    # object. Failures log one line (see _log_groq_error) and the
+    # HTTPError still propagates, so the handler returns 502 as today.
+    for attempt in range(2):
+        req = urlreq.Request(f"{GROQ_BASE}/audio/transcriptions", data=body, method="POST")
+        req.add_header("User-Agent", GROQ_UA)
+        if not apply_groq_auth(req):
+            raise RuntimeError("no Groq credential available")
+        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+        try:
+            with urlreq.urlopen(req, timeout=60) as r:
+                return json.loads(r.read()).get("text", "").strip()
+        except HTTPError as e:
+            _log_groq_error("audio/transcriptions", e)
+            if attempt == 0 and _groq_retryable(e.code):
+                print(f"groq audio/transcriptions: retrying once after HTTP {e.code}", flush=True)
+                time.sleep(2)
+                continue
+            raise
+        except Exception as e:
+            print(f"groq audio/transcriptions: {type(e).__name__}: {str(e)[:300]}", flush=True)
+            raise
 
 
 def groq_chat(text, history):
@@ -381,7 +435,10 @@ def groq_chat(text, history):
     # can spend the whole token budget thinking and return EMPTY content
     # (seen live 2026-11-15 on a longer order message at max_tokens=300).
     # Low reasoning effort + a 600-token floor keeps replies short, fast
-    # and non-empty. One retry, then a fixed fallback sentence.
+    # and non-empty. The loop caps total attempts at two: a retry fires
+    # once for an empty reply OR once for a retryable Groq HTTP error
+    # (429/5xx, transient burst-limits), then the fixed fallback
+    # sentence (empty case) or the propagated error (HTTP case).
     for attempt in range(2):
         payload = json.dumps({"model": CHAT_MODEL, "messages": msgs,
                               "temperature": 0.3, "max_tokens": 600,
@@ -391,8 +448,19 @@ def groq_chat(text, history):
         if not apply_groq_auth(req):
             raise RuntimeError("no Groq credential available")
         req.add_header("Content-Type", "application/json")
-        with urlreq.urlopen(req, timeout=60) as r:
-            content = json.loads(r.read())["choices"][0]["message"]["content"].strip()
+        try:
+            with urlreq.urlopen(req, timeout=60) as r:
+                content = json.loads(r.read())["choices"][0]["message"]["content"].strip()
+        except HTTPError as e:
+            _log_groq_error("chat/completions", e)
+            if attempt == 0 and _groq_retryable(e.code):
+                print(f"groq chat/completions: retrying once after HTTP {e.code}", flush=True)
+                time.sleep(2)
+                continue
+            raise
+        except Exception as e:
+            print(f"groq chat/completions: {type(e).__name__}: {str(e)[:300]}", flush=True)
+            raise
         if content:
             return content
     return REPEAT_REPLY
@@ -552,7 +620,7 @@ class H(BaseHTTPRequestHandler):
                 text = groq_transcribe(self._read(), ctype)
             except HTTPError as e:
                 return self._json(502, {"error": "groq_error", "status": e.code,
-                                        "detail": e.read().decode(errors="replace")[:300]})
+                                        "detail": _groq_detail(e)})
             except Exception as e:
                 return self._json(502, {"error": "groq_error", "detail": str(e)[:300]})
             return self._json(200, {"text": text,
@@ -581,7 +649,7 @@ class H(BaseHTTPRequestHandler):
                 reply, fast = get_reply(text, history)
             except HTTPError as e:
                 return self._json(502, {"error": "groq_error", "status": e.code,
-                                        "detail": e.read().decode(errors="replace")[:300]})
+                                        "detail": _groq_detail(e)})
             except Exception as e:
                 return self._json(502, {"error": "reply_failed", "detail": str(e)[:300]})
             resp = {"reply": reply, "fast_path": fast,
@@ -610,7 +678,7 @@ class H(BaseHTTPRequestHandler):
                 wav, synth_ms, cached = synth_wav_cached(reply)
             except HTTPError as e:
                 return self._json(502, {"error": "groq_error", "status": e.code,
-                                        "detail": e.read().decode(errors="replace")[:300]})
+                                        "detail": _groq_detail(e)})
             except Exception as e:
                 return self._json(502, {"error": "reply_failed", "detail": str(e)[:300]})
             resp = {"reply": reply,
