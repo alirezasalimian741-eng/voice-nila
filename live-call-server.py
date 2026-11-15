@@ -240,7 +240,21 @@ def groq_transcribe(audio_bytes, ctype):
     field("model", WHISPER_MODEL)
     field("language", "fa")
     field("response_format", "json")
-    ext = "webm" if "webm" in ctype else "wav"
+    # Whisper keys the decoder off the filename extension, so it MUST match
+    # the actual bytes: iOS Safari records audio/mp4 (NOT webm). Sending
+    # mp4 bytes named .wav made Groq fail the transcription (seen live
+    # 2026-11-15: the call page heard nothing on his iPhone).
+    ct = (ctype or "").lower()
+    if "mp4" in ct or "m4a" in ct:
+        ext = "mp4"
+    elif "webm" in ct:
+        ext = "webm"
+    elif "ogg" in ct:
+        ext = "ogg"
+    elif "wav" in ct or "x-wav" in ct:
+        ext = "wav"
+    else:
+        ext = "mp4"  # our only client is his iPhone (Safari records mp4)
     body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
              f"filename=\"mic.{ext}\"\r\nContent-Type: {ctype}\r\n\r\n").encode()
     body += audio_bytes + f"\r\n--{boundary}--\r\n".encode()
@@ -316,6 +330,11 @@ class H(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Access-Control-Allow-Origin", "*")
+            # Never cache the call page: after a redeploy his phone must
+            # get the new version, not a stale copy.
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
             self.send_header("Content-Length", str(len(page)))
             self.end_headers()
             self.wfile.write(page)

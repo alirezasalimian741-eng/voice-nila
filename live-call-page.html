@@ -16,25 +16,34 @@
             background: #2a2f38; color: #ffd479; }
   #status.ok { background: #173324; color: #7ee2a8; }
   #status.bad { background: #3a1d1d; color: #ff9a9a; }
-  #talk { width: 100%; padding: 18px; font-size: 18px; font-family: inherit; border: none;
+  #state { font-size: 16px; text-align: center; padding: 12px; margin-bottom: 8px;
+           border-radius: 12px; background: #232a33; min-height: 48px; }
+  #meterWrap { height: 10px; border-radius: 6px; background: #2a2f38; overflow: hidden; margin-bottom: 14px; }
+  #meter { height: 100%; width: 0%; background: #2e7d5b; border-radius: 6px;
+           transition: width 90ms linear; }
+  #meter.hot { background: #c0392b; }
+  #call { width: 100%; padding: 20px; font-size: 19px; font-family: inherit; border: none;
           border-radius: 14px; background: #2e7d5b; color: #fff; cursor: pointer; }
-  #talk:active, #talk.recording { background: #c0392b; }
-  #talk:disabled { background: #444; color: #999; cursor: not-allowed; }
-  #stopSpeak { width: 100%; padding: 12px; margin-top: 10px; font-size: 15px; font-family: inherit;
+  #call.live { background: #c0392b; }
+  #call:disabled { background: #444; color: #999; cursor: not-allowed; }
+  #testVoice { width: 100%; padding: 12px; margin-top: 10px; font-size: 15px; font-family: inherit;
                border: 1px solid #6e5636; border-radius: 12px; background: #3a2f1d; color: #ffd479;
-               cursor: pointer; display: none; }
+               cursor: pointer; }
+  #testVoice:disabled { opacity: .5; cursor: not-allowed; }
   .row { display: flex; gap: 8px; margin-top: 10px; }
   .row input { flex: 1; padding: 12px; border-radius: 10px; border: 1px solid #2c343f;
                background: #101418; color: #f2f2f2; font-family: inherit; font-size: 15px; }
   .row button { padding: 12px 16px; border-radius: 10px; border: none; background: #2c6e9b;
                 color: #fff; font-family: inherit; cursor: pointer; }
-  #log { margin-top: 16px; display: flex; flex-direction: column; gap: 8px; max-height: 46vh; overflow-y: auto; }
+  #log { margin-top: 16px; display: flex; flex-direction: column; gap: 8px; max-height: 42vh; overflow-y: auto; }
   .msg { padding: 10px 12px; border-radius: 12px; font-size: 15px; line-height: 1.8; white-space: pre-wrap; }
   .msg.you { background: #24344a; align-self: flex-start; }
   .msg.ai { background: #22352a; align-self: flex-end; }
   .msg.sys { background: transparent; color: #9aa7b5; font-size: 13px; text-align: center; }
+  .msg.err { background: #3a1d1d; color: #ff9a9a; font-size: 13px; text-align: center; }
   .msg .cut { color: #ff9a9a; font-size: 13px; }
   .hint { color: #9aa7b5; font-size: 12px; margin-top: 14px; line-height: 1.9; }
+  #debug { color: #5c6672; font-size: 11px; margin-top: 10px; line-height: 1.8; direction: ltr; text-align: left; }
 </style>
 </head>
 <body>
@@ -42,22 +51,36 @@
   <h1>تماس زنده با دستیار صوتی</h1>
   <p class="sub">میکروفون → Groq (شنیدن + مغز) → صدای امیر — مکالمه‌ی واقعی، نه صفحه‌ی نمایشی</p>
   <div id="status">در حال بررسی وضعیت سرور…</div>
-  <button id="talk" disabled>دکمه را نگه دار و حرف بزن</button>
-  <button id="stopSpeak">⏹ قطع صدا</button>
+  <div id="state">برای شروع، «شروع تماس» را بزن.</div>
+  <div id="meterWrap"><div id="meter"></div></div>
+  <button id="call" disabled>📞 شروع تماس</button>
+  <button id="testVoice">🔊 آزمایش صدا (بدون نیاز به میکروفون)</button>
   <div class="row">
     <input id="text" type="text" placeholder="یا اینجا بنویس…" autocomplete="off">
     <button id="send">ارسال</button>
   </div>
   <div id="log"></div>
-  <p class="hint">بدون کلید Groq، شنیدن و جواب‌دادن کار نمی‌کند و همین‌جا صادقانه گفته می‌شود؛
-  دکمه‌ی صدا (تست امیر) بدون کلید هم کار می‌کند. هر جواب حدود ۲ تا ۴ ثانیه طول می‌کشد.
-  جواب‌ها جمله‌به‌جمله پخش می‌شوند؛ وسط حرف‌زدن دستیار، دکمه‌ی صحبت یا «قطع صدا» را بزنی، فوری ساکت می‌شود و گوش می‌دهد.</p>
+  <p class="hint">یک بار «شروع تماس» را بزن؛ بعد لازم نیست دکمه‌ای را نگه داری — هر وقت حرف بزنی
+  گوش می‌دهد، وقتی ساکت شدی جواب می‌دهد، و وسط حرفش هم حرف بزنی ساکت می‌شود و گوش می‌دهد.
+  هر جواب چند ثانیه طول می‌کشد (ساخت صدا روی سرور رایگان کند است). اگر چیزی کار نکرد،
+  خطایش همین‌جا نوشته می‌شود.</p>
+  <div id="debug"></div>
 </div>
 <script>
 const $ = id => document.getElementById(id);
-const statusEl = $('status'), talkBtn = $('talk'), logEl = $('log'), stopBtn = $('stopSpeak');
+const statusEl = $('status'), stateEl = $('state'), meterEl = $('meter'),
+      callBtn = $('call'), testBtn = $('testVoice'), logEl = $('log'), debugEl = $('debug');
 const history = [];
-let mediaRecorder = null, chunks = [], recording = false;
+
+/* ---------- حالت مکالمه ---------- */
+let callActive = false, micStream = null, audioCtx = null, analyser = null, analyserData = null;
+let recorder = null, recChunks = [], recording = false, recMime = '';
+let vadTimer = null, turnBusy = false, speaking = false;
+let lastSpeechAt = 0, speechStartAt = 0, overFrames = 0, bargeFrames = 0;
+let currentSource = null, currentAiEl = null, playGen = 0;
+
+const SPEAK_TH = 0.03, BARGE_TH = 0.08, SILENCE_MS = 1200,
+      MIN_SPEECH_MS = 400, MAX_UTT_MS = 30000;
 
 function addMsg(cls, text) {
   const d = document.createElement('div');
@@ -65,194 +88,286 @@ function addMsg(cls, text) {
   logEl.appendChild(d); logEl.scrollTop = logEl.scrollHeight;
   return d;
 }
-function setStatus(text, kind) {
-  statusEl.textContent = text;
-  statusEl.className = kind || '';
-}
+function setStatus(text, kind) { statusEl.textContent = text; statusEl.className = kind || ''; }
+function setState(text) { stateEl.textContent = text; }
+function setDebug(text) { debugEl.textContent = text; }
+function showError(text) { addMsg('err', text); setDebug('last error: ' + text); }
+
 async function refreshHealth() {
   try {
     const r = await fetch('/health');
     const h = await r.json();
     if (h.groq_configured) {
       setStatus('متصل — کلید Groq هست، تماس زنده آماده‌ست.', 'ok');
-      talkBtn.disabled = false;
+      callBtn.disabled = false;
     } else {
       setStatus('سرور روشن است ولی کلید Groq نیست — شنیدن/جواب تا رسیدن کلید کار نمی‌کند.', 'bad');
-      talkBtn.disabled = true;
+      callBtn.disabled = true;
     }
   } catch (e) {
-    setStatus('به سرور (پورت ۸۷۶۶) وصل نشدم — سرور خاموش است.', 'bad');
-    talkBtn.disabled = true;
+    setStatus('به سرور وصل نشدم — سرور خاموش است یا اینترنت قطع است.', 'bad');
+    callBtn.disabled = true;
   }
 }
 
-/* ---------- موتور صدا: پخش جمله‌به‌جمله (استریمینگ) + قطع حرف (barge-in) ---------- */
-let speechGen = 0;          // با هر قطع/شروع تازه، باطل‌کردن صف قبلی
-let currentAudio = null, currentResolve = null, speaking = false;
-let currentAiEl = null;     // حباب جوابی که الان در حال پخش است
-let fillerAudio = null, fillerGen = 0;
-
-function splitSentences(text) {
-  const parts = String(text).match(/[^.!؟?…]+[.!؟?…]*/g) || [String(text)];
-  return parts.map(s => s.trim()).filter(Boolean);
-}
-function updateStopBtn() { stopBtn.style.display = speaking ? 'block' : 'none'; }
-async function fetchSpeak(text) {
-  try {
-    const r = await fetch('/speak', { method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }) });
-    if (!r.ok) return null;
-    return URL.createObjectURL(await r.blob());
-  } catch (e) { return null; }
-}
-function stopFiller() {
-  fillerGen++;
-  if (fillerAudio) { try { fillerAudio.pause(); } catch (e) {} fillerAudio = null; }
-}
-async function speakFiller(text) {
-  const g = ++fillerGen;
-  const url = await fetchSpeak(text);
-  if (!url) return;
-  if (g !== fillerGen) { URL.revokeObjectURL(url); return; }
-  fillerAudio = new Audio(url);
-  fillerAudio.onended = () => { URL.revokeObjectURL(url); fillerAudio = null; };
-  fillerAudio.play().catch(() => {});
-}
-async function streamSpeak(fullText) {
-  stopFiller();
-  const gen = ++speechGen;
-  const sentences = splitSentences(fullText);
-  if (!sentences.length) return;
-  speaking = true; updateStopBtn();
-  // جمله‌ی بعدی را هنگام پخش جمله‌ی فعلی از سرور بگیر تا مکث نیفتد
-  let nextUrlP = fetchSpeak(sentences[0]);
-  for (let i = 0; i < sentences.length; i++) {
-    if (gen !== speechGen) break;
-    const url = await nextUrlP;
-    if (gen !== speechGen) { if (url) URL.revokeObjectURL(url); break; }
-    nextUrlP = (i + 1 < sentences.length) ? fetchSpeak(sentences[i + 1]) : null;
-    if (!url) continue;
-    await new Promise(res => {
-      const a = new Audio(url);
-      currentAudio = a; currentResolve = res;
-      const done = () => { URL.revokeObjectURL(url); if (currentResolve === res) currentResolve = null; res(); };
-      a.onended = done; a.onerror = done;
-      a.play().catch(done);
-    });
-    currentAudio = null;
+function pickMime() {
+  const cands = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm',
+                 'audio/ogg;codecs=opus', 'audio/wav', ''];
+  if (typeof MediaRecorder === 'undefined') return null;
+  for (const c of cands) {
+    if (!c) return '';
+    try { if (MediaRecorder.isTypeSupported(c)) return c; } catch (e) {}
   }
-  if (gen === speechGen) { speaking = false; currentAiEl = null; updateStopBtn(); }
+  return '';
+}
+
+async function ensureAudioCtx() {
+  if (!audioCtx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) throw new Error('مرورگر AudioContext ندارد.');
+    audioCtx = new AC();
+  }
+  if (audioCtx.state !== 'running') { try { await audioCtx.resume(); } catch (e) {} }
+  return audioCtx;
+}
+
+/* ---------- پخش صدا از روی AudioContext (در iOS باید با لمس کاربر باز شده باشد) ---------- */
+async function playWavBytes(arrayBuffer) {
+  const ctx = await ensureAudioCtx();
+  let buf;
+  try { buf = await ctx.decodeAudioData(arrayBuffer.slice(0)); }
+  catch (e) { throw new Error('صدا رمزگشایی نشد: ' + e.message); }
+  const gen = ++playGen;
+  speaking = true;
+  setState('در حال صحبت… (برای قطع‌کردن، حرف بزن)');
+  await new Promise(res => {
+    const src = ctx.createBufferSource();
+    const gain = ctx.createGain();
+    gain.gain.value = 1.0;
+    src.buffer = buf; src.connect(gain); gain.connect(ctx.destination);
+    currentSource = src;
+    src.onended = () => { if (currentSource === src) currentSource = null; res(); };
+    try { src.start(); } catch (e) { res(); }
+  });
+  if (gen === playGen) { speaking = false; }
 }
 function stopPlayback(mark) {
-  if (!speaking && !currentAudio) return;
-  speechGen++;
-  if (currentAudio) { try { currentAudio.pause(); } catch (e) {} currentAudio = null; }
-  if (currentResolve) { const r = currentResolve; currentResolve = null; r(); }
-  speaking = false; updateStopBtn();
-  if (mark && currentAiEl) {                       // نشانه‌ی «قطع شد» در متن مکالمه
+  playGen++;
+  if (currentSource) { try { currentSource.stop(); } catch (e) {} try { currentSource.disconnect(); } catch (e) {} currentSource = null; }
+  speaking = false;
+  if (mark && currentAiEl) {
     const s = document.createElement('span');
     s.className = 'cut'; s.textContent = ' ✂ قطع شد';
-    currentAiEl.appendChild(s);
+    currentAiEl.appendChild(s); currentAiEl = null;
   }
-  currentAiEl = null;
 }
-stopBtn.addEventListener('click', () => stopPlayback(true));
+function b64ToBytes(b64) {
+  const bin = atob(b64), out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out.buffer;
+}
 
+/* ---------- مکالمه: شنیدن → جواب ---------- */
 async function askReply(text) {
   addMsg('you', text);
   const waitEl = addMsg('sys', '…در حال فکر کردن');
-  let fillerEl = null;
-  // پرکننده: اگر جواب بیش از ~۱٫۲ ثانیه طول کشید
-  const fillerTimer = setTimeout(() => {
-    fillerEl = addMsg('sys', 'یه لحظه دارم چک می‌کنم…');
-    speakFiller('یه لحظه دارم چک می‌کنم');
-  }, 1200);
   try {
     const r = await fetch('/reply', { method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text, history }) });
-    const data = await r.json();
-    clearTimeout(fillerTimer);
-    waitEl.remove(); if (fillerEl) fillerEl.remove();
+    const data = await r.json().catch(() => ({}));
+    waitEl.remove();
     if (!r.ok) {
-      stopFiller();
       if (data.error === 'groq_key_missing')
-        addMsg('sys', 'کلید Groq هنوز نرسیده — بدون آن نمی‌توانم بشنوم و جواب بدهم.');
+        showError('کلید Groq هنوز نرسیده — بدون آن نمی‌توانم بشنوم و جواب بدهم.');
       else
-        addMsg('sys', 'خطا از سرور: ' + (data.detail || data.error || r.status));
+        showError('خطا از سرور (' + r.status + '): ' + (data.detail || data.error || 'نامشخص'));
       return;
     }
     history.push({ role: 'user', content: text }, { role: 'assistant', content: data.reply });
     currentAiEl = addMsg('ai', data.reply + (data.ms ? '  (' + (data.ms / 1000).toFixed(1) + ' ثانیه)' : ''));
+    setDebug('reply ms=' + (data.ms || '?') + ' synth_ms=' + (data.synth_ms || '?') +
+             ' audio=' + (data.audio_b64 ? Math.round(data.audio_b64.length * 0.75 / 1024) + 'KB' : 'none'));
     if (data.tool_result && data.tool_result.tracking_code) {
       addMsg('sys', (data.tool_result.duplicate
         ? 'این درخواست قبلاً ثبت شده بود — کد پیگیری: '
         : 'درخواست ثبت شد — کد پیگیری: ') + data.tool_result.tracking_code);
     }
-    streamSpeak(data.reply);   // پخش جمله‌به‌جمله، بدون صبر برای کل جواب
+    if (data.audio_b64) {
+      try { await playWavBytes(b64ToBytes(data.audio_b64)); }
+      catch (e) { showError('جواب رسید ولی پخش صدا نشد: ' + e.message); }
+    } else {
+      showError('جواب رسید ولی فایل صدا همراهش نبود.');
+    }
   } catch (e) {
-    clearTimeout(fillerTimer);
-    waitEl.remove(); if (fillerEl) fillerEl.remove();
-    addMsg('sys', 'ارتباط با سرور قطع شد.');
+    waitEl.remove();
+    showError('ارتباط با سرور قطع شد: ' + e.message);
   }
 }
+
 async function sendAudio(blob) {
-  const waitEl = addMsg('sys', '…در حال شنیدن صدا');
+  turnBusy = true;
+  setState('در حال شنیدن صدا…');
+  const t0 = Date.now();
   try {
     const r = await fetch('/transcribe', { method: 'POST', body: blob });
-    const data = await r.json();
-    waitEl.remove();
+    const data = await r.json().catch(() => ({}));
+    setDebug('transcribe: ' + blob.size + ' bytes, ' + (blob.type || 'no-type') +
+             ', ' + (Date.now() - t0) + 'ms -> ' + r.status);
     if (!r.ok) {
       if (data.error === 'groq_key_missing')
-        addMsg('sys', 'کلید Groq هنوز نرسیده — صدا شنیده نشد.');
+        showError('کلید Groq هنوز نرسیده — صدا شنیده نشد.');
       else
-        addMsg('sys', 'خطا در شنیدن: ' + (data.detail || data.error || r.status));
+        showError('خطا در شنیدن (' + r.status + '): ' + (data.detail || data.error || 'نامشخص'));
       return;
     }
     if (!data.text) { addMsg('sys', 'چیزی شنیده نشد — دوباره حرف بزن.'); return; }
-    askReply(data.text);
+    await askReply(data.text);
   } catch (e) {
-    waitEl.remove();
-    addMsg('sys', 'ارتباط با سرور قطع شد.');
+    showError('ارتباط با سرور قطع شد: ' + e.message);
+  } finally {
+    turnBusy = false;
+    if (callActive) setState('گوش می‌دهم… حرف بزن.');
   }
 }
-talkBtn.addEventListener('pointerdown', async () => {
-  if (speaking) stopPlayback(true);   // barge-in: اول فوری ساکتش کن، بعد گوش بده
-  if (recording) return;
+
+/* ---------- تشخیص گفتار (VAD) روی میکروفون ---------- */
+function micLevel() {
+  if (!analyser) return 0;
+  analyser.getFloatTimeDomainData(analyserData);
+  let sum = 0;
+  for (let i = 0; i < analyserData.length; i++) sum += analyserData[i] * analyserData[i];
+  return Math.sqrt(sum / analyserData.length);
+}
+function startUtterance() {
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    chunks = [];
-    mediaRecorder = new MediaRecorder(stream);
-    mediaRecorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
-    mediaRecorder.onstop = () => {
-      stream.getTracks().forEach(t => t.stop());
-      sendAudio(new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/webm' }));
-    };
-    mediaRecorder.start();
-    recording = true;
-    talkBtn.classList.add('recording');
-    talkBtn.textContent = '…در حال ضبط — رها کن تا بفرستم';
+    recChunks = [];
+    recorder = recMime ? new MediaRecorder(micStream, { mimeType: recMime })
+                       : new MediaRecorder(micStream);
   } catch (e) {
-    addMsg('sys', 'دسترسی به میکروفون داده نشد.');
+    try { recorder = new MediaRecorder(micStream); }
+    catch (e2) { showError('ضبط صدا در این مرورگر ممکن نشد: ' + e2.message); endCall(); return; }
+  }
+  recorder.ondataavailable = e => { if (e.data && e.data.size) recChunks.push(e.data); };
+  recorder.onstop = () => {
+    const type = recorder.mimeType || recMime || 'audio/webm';
+    sendAudio(new Blob(recChunks, { type }));
+  };
+  try { recorder.start(250); }
+  catch (e) { showError('شروع ضبط نشد: ' + e.message); return; }
+  recording = true;
+  speechStartAt = Date.now(); lastSpeechAt = speechStartAt;
+  setState('…در حال ضبط');
+}
+function stopUtterance() {
+  if (!recording || !recorder) return;
+  recording = false;
+  try { recorder.stop(); } catch (e) {}
+}
+function vadTick() {
+  if (!callActive) return;
+  const rms = micLevel();
+  const pct = Math.min(100, Math.round(rms * 300));
+  meterEl.style.width = pct + '%';
+  meterEl.classList.toggle('hot', rms > SPEAK_TH);
+  const now = Date.now();
+  if (speaking) {
+    // وسط حرف دستیار: اگر کاربر واقعاً حرف زد، قطع کن و گوش بده
+    if (rms > BARGE_TH) { if (++bargeFrames >= 3) { bargeFrames = 0; stopPlayback(true); } }
+    else bargeFrames = 0;
+    return;
+  }
+  if (turnBusy) return;
+  if (recording) {
+    if (rms > SPEAK_TH) lastSpeechAt = now;
+    if ((now - lastSpeechAt > SILENCE_MS && now - speechStartAt > MIN_SPEECH_MS) ||
+        now - speechStartAt > MAX_UTT_MS) stopUtterance();
+  } else {
+    if (rms > SPEAK_TH) { if (++overFrames >= 2) { overFrames = 0; startUtterance(); } }
+    else overFrames = 0;
+  }
+}
+
+/* ---------- شروع / قطع تماس ---------- */
+async function startCall() {
+  callBtn.disabled = true;
+  try {
+    await refreshHealth();
+    await ensureAudioCtx();   // بازکردن صدا باید داخل همین لمس انجام شود (iOS)
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
+      throw new Error('این مرورگر به میکروفون دسترسی نمی‌دهد.');
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    const ctx = audioCtx;
+    const src = ctx.createMediaStreamSource(micStream);
+    analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+    analyserData = new Float32Array(analyser.fftSize);
+    src.connect(analyser);
+    recMime = pickMime();
+    if (recMime === null) throw new Error('این مرورگر ضبط صدا (MediaRecorder) ندارد.');
+    setDebug('recorder mime: ' + (recMime || '(default)'));
+    callActive = true;
+    vadTimer = setInterval(vadTick, 100);
+    setState('گوش می‌دهم… حرف بزن.');
+    callBtn.textContent = '📵 قطع تماس';
+    callBtn.classList.add('live');
+    callBtn.disabled = false;
+  } catch (e) {
+    callBtn.disabled = false;
+    if (e && (e.name === 'NotAllowedError' || e.name === 'SecurityError'))
+      showError('دسترسی به میکروفون داده نشد — در Safari روی آیکون «aA» ← تنظیمات وب‌سایت ← میکروفون را «اجازه بده» بزن و دوباره امتحان کن.');
+    else if (e && e.name === 'NotFoundError')
+      showError('میکروفونی پیدا نشد.');
+    else
+      showError('شروع تماس نشد: ' + (e.message || e));
+    if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  }
+}
+function endCall() {
+  callActive = false;
+  if (vadTimer) { clearInterval(vadTimer); vadTimer = null; }
+  if (recording) { try { recorder.stop(); } catch (e) {} recording = false; }
+  stopPlayback(false);
+  turnBusy = false;
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  analyser = null;
+  meterEl.style.width = '0%';
+  setState('تماس قطع شد. برای شروع دوباره، «شروع تماس» را بزن.');
+  callBtn.textContent = '📞 شروع تماس';
+  callBtn.classList.remove('live');
+}
+callBtn.addEventListener('click', () => { callActive ? endCall() : startCall(); });
+
+/* ---------- آزمایش بلندگو (بدون میکروفون و بدون کلید) ---------- */
+testBtn.addEventListener('click', async () => {
+  testBtn.disabled = true;
+  try {
+    const r = await fetch('/speak', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'سلام، صدای من را می‌شنوید؟ من منشی فروشگاه دوخت نیلا هستم.' }) });
+    if (!r.ok) throw new Error('سرور صدا را نساخت (' + r.status + ').');
+    await playWavBytes(await (await r.blob()).arrayBuffer());
+    addMsg('sys', 'آزمایش صدا پخش شد — اگر نشنیدی، صدای گوشی را بلند کن.');
+  } catch (e) {
+    showError('آزمایش صدا نشد: ' + e.message);
+  } finally {
+    testBtn.disabled = false;
   }
 });
-function stopTalk() {
-  if (!recording || !mediaRecorder) return;
-  recording = false;
-  talkBtn.classList.remove('recording');
-  talkBtn.textContent = 'دکمه را نگه دار و حرف بزن';
-  mediaRecorder.stop();
-}
-talkBtn.addEventListener('pointerup', stopTalk);
-talkBtn.addEventListener('pointerleave', stopTalk);
-$('send').addEventListener('click', () => {
+
+/* ---------- تایپ به‌جای حرف‌زدن ---------- */
+async function sendText() {
   const t = $('text').value.trim();
   if (!t) return;
   $('text').value = '';
+  if (speaking) stopPlayback(true);
+  await ensureAudioCtx().catch(() => {});
   askReply(t);
-});
-$('text').addEventListener('keydown', e => { if (e.key === 'Enter') $('send').click(); });
+}
+$('send').addEventListener('click', sendText);
+$('text').addEventListener('keydown', e => { if (e.key === 'Enter') sendText(); });
+
 refreshHealth();
 </script>
 </body>
