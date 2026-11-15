@@ -16,14 +16,16 @@ Tools layer ("software decides, model requests" — BUILD-STANDARD.md):
   true -> 422 confirmation_required and nothing is stored; an already
   seen idempotency_key returns the ORIGINAL record with duplicate:true
   instead of storing a second one. Records append one JSON line each to
-  requests.jsonl and get a tracking code (NV-0001, ...). GET /requests
+  requests.jsonl and get a plain numeric tracking code (1001, 1002, ...).
+  GET /requests
   lists them for the owner. /reply also accepts an optional "tool_call"
   object with the same shape and returns its outcome as "tool_result".
 
 Persona: the receptionist system prompt is loaded from the file named
-by RECEPTIONIST_PROMPT_FILE (default: receptionist-system-prompt.txt,
-extracted from receptionist-nila-brain.md §4), so personas are swappable
-without touching code.
+by RECEPTIONIST_PROMPT_FILE (default: receptionist-system-prompt.txt),
+so personas are swappable without touching code. The current persona
+is Alireza's personal receptionist (message-taking + callback
+registration only; no personal information is ever revealed).
 
 Groq auth has two sources, in order: the GROQ_API_KEY environment
 variable (the VPS/host path), or the stored Muse connection custom.groq
@@ -46,9 +48,26 @@ Cloudflare returns 1010 before auth is checked; (2) gpt-oss-120b
 needs reasoning_effort=low + max_tokens>=600 or it can return empty
 content after spending the budget on reasoning.
 
+Fix round 3 (2026-11-15): the user rejected the live call as too slow
+and dumb. Research verdicts: Groq TTS has NO Persian (English + Arabic
+Saudi Orpheus only), and every Piper fa_IR voice is medium-only, so
+Piper stays the voice. The slowness was synthesis on Railway's 0.1 CPU
+(~5s a reply), so stock replies are pre-synthesized at startup into an
+in-memory cache and common intents get pinned replies with no LLM
+round-trip, with exact pinned sentences the LLM reproduces so turns
+hit the same audio cache.
+
+Rebuild (2026-11-15): the shop scope was dropped entirely at the
+user's order — the assistant is now Alireza's PERSONAL receptionist
+(first name only; takes messages, registers callback requests, and
+never reveals personal information). The cache/fast-path/streaming
+mechanisms from fix round 3 are kept; all pinned replies, intents,
+cache strings, the greeting, the Whisper domain prompt and the
+tracking-code format were replaced with personal-receptionist ones.
+
 Run on the VPS via systemd (see vps-setup.sh); locally with the piper venv python.
 """
-import base64, io, json, os, sys, threading, time, wave
+import base64, io, json, os, re, sys, threading, time, wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib import request as urlreq
 from urllib.error import HTTPError
@@ -134,7 +153,7 @@ def store_request(data):
                 out["duplicate"] = True
                 return 200, out
         rec = {
-            "tracking_code": "NV-" + str(len(recs) + 1).zfill(4),
+            "tracking_code": str(1001 + len(recs)),
             "type": data["type"],
             "name": (data.get("name") or "").strip(),
             "phone": (data.get("phone") or "").strip(),
@@ -231,6 +250,86 @@ def synth_wav(text):
     return buf.getvalue(), round((time.time() - t0) * 1000)
 
 
+# ---- TTS cache + pinned replies (fix round 3 + personal rebuild, 2026-11-15) ----
+# Stock replies are synthesized once at startup (background thread; the
+# port opens immediately) and served from memory. Runtime synthesis is
+# also cached, so any repeated sentence is instant afterwards.
+def _normalize_text(s):
+    s = (s or "").strip()
+    s = s.replace("ي", "ی").replace("ك", "ک").replace("ـ", "")
+    s = re.sub(r"\s+", " ", s)
+    return s.strip(" .!؟?…،")
+
+
+SYNTH_LOCK = threading.Lock()  # serialize ONNX synthesis: thread-safe, no contention on 0.1 CPU
+TTS_CACHE = {}
+TTS_CACHE_MAX = 200
+TTS_CACHE_LOCK = threading.Lock()
+WARMUP_TOTAL = 0
+WARMUP_DONE = threading.Event()
+
+# Pinned replies. These exact strings also appear in the persona file
+# as the required sentences for their cases, so LLM turns reproduce
+# the same text and hit the same audio cache. Keep both files in sync.
+GREETING = "سلام! من منشی علیرضا هستم. چطور می‌تونم کمکتون کنم؟"
+REDIRECT = "من منشی علیرضا هستم و فقط پیام می‌گیرم و درخواست تماس برگشتی ثبت می‌کنم. پیامی دارید؟"
+TAKE_MESSAGE = "پیامتون رو می‌گیرم و به علیرضا می‌رسونم. نام، شماره‌ی تماس و پیامتون رو بگید."
+SERVICES_REPLY = "علیرضا طراحی سایت انجام می‌ده، از جمله سایت‌های سه‌بعدی. اگه سفارش سایت دارید، پیامتون رو ثبت می‌کنم."
+PRIVACY_REPLY = "نمی‌تونم اطلاعات شخصی علیرضا رو بدم. اگه پیامی دارید، می‌گیرم و بهش می‌رسونم."
+UNKNOWN_REPLY = "این رو نمی‌دونم و حدس نمی‌زنم. نام و شماره‌تون رو بدید تا درخواست تماس برگشتی ثبت کنم."
+CALLBACK_REPLY = "حتماً. نام، شماره‌ی تماس و موضوع رو بگید تا درخواست تماس برگشتی رو ثبت کنم."
+REPEAT_REPLY = "متأسفم، درست نشنیدم. می‌شه دوباره بگید؟"
+
+
+def split_sentences(text):
+    # Mirrors the call page's splitter (live-call-page.html):
+    # /[^.!؟?…]+[.!؟?…]*/g, trimmed. Pre-warming these exact strings is
+    # what makes per-sentence /speak calls hit the cache.
+    parts = re.findall(r"[^.!؟?…]+[.!؟?…]*", str(text))
+    out = [p.strip() for p in parts if p.strip()]
+    return out or [str(text).strip()]
+
+
+def synth_wav_cached(text):
+    key = _normalize_text(text)
+    with TTS_CACHE_LOCK:
+        hit = TTS_CACHE.get(key)
+    if hit is not None:
+        return hit, 0, True
+    with SYNTH_LOCK:
+        with TTS_CACHE_LOCK:
+            hit = TTS_CACHE.get(key)
+        if hit is not None:
+            return hit, 0, True
+        wav, ms = synth_wav(text)
+        with TTS_CACHE_LOCK:
+            if len(TTS_CACHE) >= TTS_CACHE_MAX:
+                TTS_CACHE.pop(next(iter(TTS_CACHE)))
+            TTS_CACHE[key] = wav
+        return wav, ms, False
+
+
+def _warm_tts_cache():
+    global WARMUP_TOTAL
+    texts = [GREETING, REDIRECT, TAKE_MESSAGE, SERVICES_REPLY, PRIVACY_REPLY,
+             UNKNOWN_REPLY, CALLBACK_REPLY, REPEAT_REPLY]
+    queue, seen = [], set()
+    for t in texts:
+        for s in split_sentences(t) + [t]:
+            k = _normalize_text(s)
+            if k and k not in seen:
+                seen.add(k)
+                queue.append(s)
+    WARMUP_TOTAL = len(queue)
+    for s in queue:
+        try:
+            synth_wav_cached(s)
+        except Exception as e:
+            print(f"tts warmup failed for {s[:30]!r}: {e}", flush=True)
+    WARMUP_DONE.set()
+    print(f"tts cache warmed: {len(TTS_CACHE)} entries", flush=True)
+
+
 def groq_transcribe(audio_bytes, ctype):
     boundary = "----livecall" + str(int(time.time() * 1000))
     body = b""
@@ -240,10 +339,11 @@ def groq_transcribe(audio_bytes, ctype):
     field("model", WHISPER_MODEL)
     field("language", "fa")
     field("response_format", "json")
-    # Domain prompt: Whisper hears shop words (دم‌کنی، دستگیره) far better
-    # when primed; without it, real phone speech garbled them (seen live
-    # 2026-11-15: "درست نمی‌فهمه، اشتباه تایپ می‌کنه").
-    field("prompt", "دوخت نیلا، دم‌کنی، دستگیره، دستگیره چاپی، روکش قابلمه، فلاسک، کیسه نان، ساک نظم‌دهنده، سفارش، قیمت، دایرکت، تلگرام، واتساپ، ارسال")
+    # Domain prompt: Whisper hears receptionist words (پیام، تماس برگشتی،
+    # علیرضا) far better when primed; without it, real phone speech
+    # garbled domain words (seen live 2026-11-15: "درست نمی‌فهمه،
+    # اشتباه تایپ می‌کنه").
+    field("prompt", "علیرضا، پیام، تماس برگشتی، نام، شماره تماس، طراحی سایت، سایت سه‌بعدی، سفارش سایت، قرار، جلسه")
     # Whisper keys the decoder off the filename extension, so it MUST match
     # the actual bytes: iOS Safari records audio/mp4 (NOT webm). Sending
     # mp4 bytes named .wav made Groq fail the transcription (seen live
@@ -284,7 +384,7 @@ def groq_chat(text, history):
     # and non-empty. One retry, then a fixed fallback sentence.
     for attempt in range(2):
         payload = json.dumps({"model": CHAT_MODEL, "messages": msgs,
-                              "temperature": 0.7, "max_tokens": 600,
+                              "temperature": 0.3, "max_tokens": 600,
                               "reasoning_effort": "low"}).encode()
         req = urlreq.Request(f"{GROQ_BASE}/chat/completions", data=payload, method="POST")
         req.add_header("User-Agent", GROQ_UA)
@@ -295,7 +395,67 @@ def groq_chat(text, history):
             content = json.loads(r.read())["choices"][0]["message"]["content"].strip()
         if content:
             return content
-    return "متأسفم، جوابتون رو درست نگرفتم. می‌شه دوباره بگید؟"
+    return REPEAT_REPLY
+
+
+_GREETINGS = {"سلام", "سلام علیکم", "درود", "وقت بخیر", "سلام وقت بخیر",
+              "روز بخیر", "سلام روز بخیر", "شب بخیر", "سلام شب بخیر",
+              "سلام خسته نباشید", "خسته نباشید"}
+# Privacy probes: the caller asking for ALIREZA's own number/address.
+# Possessive/attributed forms only — a caller offering their OWN number
+# ("شماره‌م رو بدم؟") must not match.
+_PRIVACY_KEYS = ("شماره‌ش", "شماره علیرضا", "شماره موبایلش", "شماره تلفنش",
+                 "شماره تماسش", "موبایلش", "تلفنش", "آدرسش", "آدرس علیرضا",
+                 "خونه‌ش", "منزلش")
+_SERVICES_KEYS = ("چیکار", "چه کار", "شغلش", "شغل علیرضا", "کارت چیه",
+                  "کار علیرضا", "سایت می‌ساز", "سایت می‌سازه")
+_CALLBACK_KEYS = ("تماس برگشتی", "زنگ بزن", "زنگ بزنه", "قرار", "جلسه",
+                  "سفارش سایت", "سایت می‌خوام", "سایت می‌خوایم")
+
+
+def pinned_reply(text):
+    """Deterministic fast path for the most common caller intents.
+
+    Returns a pinned reply string, or None to fall through to the LLM.
+    Pinned replies are pre-synthesized at startup, so these turns skip
+    both the LLM round-trip and Piper synthesis.
+    """
+    norm = _normalize_text(text)
+    if not norm:
+        return None
+    # A leading greeting ("سلام، علیرضا هست؟") is stripped so the real
+    # intent underneath still matches; a bare greeting gets the greeting.
+    m = re.match(r"^(سلام علیکم|سلام وقت بخیر|سلام روز بخیر|سلام شب بخیر|"
+                 r"سلام خسته نباشید|سلام|درود|وقت بخیر)([،, ].*|$)", norm)
+    if m:
+        rest = m.group(2).strip(" ،,")
+        if not rest:
+            return GREETING
+        norm = rest
+    if norm in _GREETINGS:
+        return GREETING
+    # Privacy first: never let a probe for his number/address fall
+    # through to a helpful-sounding LLM answer.
+    if any(k in norm for k in _PRIVACY_KEYS):
+        return PRIVACY_REPLY
+    if "پیام" in norm or "پیغام" in norm:
+        return TAKE_MESSAGE
+    if any(k in norm for k in _CALLBACK_KEYS):
+        return CALLBACK_REPLY
+    if any(k in norm for k in ("کار دارم", "حرف بزنم", "صحبت کنم")):
+        return TAKE_MESSAGE
+    if "علیرضا" in norm and any(k in norm for k in ("هست", "کجاست", "می‌خوام")):
+        return TAKE_MESSAGE
+    if any(k in norm for k in _SERVICES_KEYS):
+        return SERVICES_REPLY
+    return None
+
+
+def get_reply(text, history):
+    pinned = pinned_reply(text)
+    if pinned is not None:
+        return pinned, True
+    return groq_chat(text, history), False
 
 
 class H(BaseHTTPRequestHandler):
@@ -347,7 +507,10 @@ class H(BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "voice": "fa_IR-amir-medium",
                              "groq_configured": groq_available(),
                              "whisper": WHISPER_MODEL, "chat": CHAT_MODEL,
-                             "persona_file": PROMPT_FILE})
+                             "persona_file": PROMPT_FILE,
+                             "tts_cache": {"entries": len(TTS_CACHE),
+                                           "warmup_done": WARMUP_DONE.is_set(),
+                                           "warmup_total": WARMUP_TOTAL}})
         elif self.path == "/requests":
             self._json(200, load_requests())
         else:
@@ -369,11 +532,12 @@ class H(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "bad json"})
             if not text:
                 return self._json(400, {"error": "empty text"})
-            wav, ms = synth_wav(text)
+            wav, ms, cached = synth_wav_cached(text)
             self.send_response(200)
             self.send_header("Content-Type", "audio/wav")
             self.send_header("Content-Length", str(len(wav)))
             self.send_header("X-Synth-Ms", str(ms))
+            self.send_header("X-Cache", "hit" if cached else "miss")
             self.end_headers()
             self.wfile.write(wav)
             return
@@ -414,13 +578,13 @@ class H(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "empty text"})
             t0 = time.time()
             try:
-                reply = groq_chat(text, history)
+                reply, fast = get_reply(text, history)
             except HTTPError as e:
                 return self._json(502, {"error": "groq_error", "status": e.code,
                                         "detail": e.read().decode(errors="replace")[:300]})
             except Exception as e:
                 return self._json(502, {"error": "reply_failed", "detail": str(e)[:300]})
-            resp = {"reply": reply,
+            resp = {"reply": reply, "fast_path": fast,
                     "ms": round((time.time() - t0) * 1000)}
             if isinstance(tool_call, dict):
                 _code, resp["tool_result"] = store_request(tool_call)
@@ -442,8 +606,8 @@ class H(BaseHTTPRequestHandler):
                 return self._json(400, {"error": "empty text"})
             t0 = time.time()
             try:
-                reply = groq_chat(text, history)
-                wav, synth_ms = synth_wav(reply)
+                reply, fast = get_reply(text, history)
+                wav, synth_ms, cached = synth_wav_cached(reply)
             except HTTPError as e:
                 return self._json(502, {"error": "groq_error", "status": e.code,
                                         "detail": e.read().decode(errors="replace")[:300]})
@@ -453,7 +617,8 @@ class H(BaseHTTPRequestHandler):
                     "audio_b64": base64.b64encode(wav).decode(),
                     "audio_mime": "audio/wav",
                     "ms": round((time.time() - t0) * 1000),
-                    "synth_ms": synth_ms}
+                    "synth_ms": synth_ms, "fast_path": fast,
+                    "cache": "hit" if cached else "miss"}
             if isinstance(tool_call, dict):
                 # Same code-enforced store as POST /tools/request; the
                 # outcome rides back so the page can show the tracking code.
@@ -465,4 +630,7 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    # Pre-synthesize stock replies in the background: the port opens
+    # immediately, and the cache fills while the first calls come in.
+    threading.Thread(target=_warm_tts_cache, daemon=True).start()
     ThreadingHTTPServer((HOST, PORT), H).serve_forever()

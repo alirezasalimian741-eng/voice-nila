@@ -484,7 +484,7 @@ callBtn.addEventListener('click', () => { callActive ? endCall() : startCall(); 
 testBtn.addEventListener('click', async () => {
   testBtn.disabled = true;
   try {
-    const buf = await fetchSpeakBuf('سلام، صدای من را می‌شنوید؟ من منشی فروشگاه دوخت نیلا هستم.');
+    const buf = await fetchSpeakBuf('سلام، صدای من را می‌شنوید؟ من منشی علیرضا هستم.');
     if (!buf) throw new Error('سرور صدا را نساخت.');
     const myGen = ++playGen;
     await playBuffer(buf);
