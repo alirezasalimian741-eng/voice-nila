@@ -240,6 +240,10 @@ def groq_transcribe(audio_bytes, ctype):
     field("model", WHISPER_MODEL)
     field("language", "fa")
     field("response_format", "json")
+    # Domain prompt: Whisper hears shop words (دم‌کنی، دستگیره) far better
+    # when primed; without it, real phone speech garbled them (seen live
+    # 2026-11-15: "درست نمی‌فهمه، اشتباه تایپ می‌کنه").
+    field("prompt", "دوخت نیلا، دم‌کنی، دستگیره، دستگیره چاپی، روکش قابلمه، فلاسک، کیسه نان، ساک نظم‌دهنده، سفارش، قیمت، دایرکت، تلگرام، واتساپ، ارسال")
     # Whisper keys the decoder off the filename extension, so it MUST match
     # the actual bytes: iOS Safari records audio/mp4 (NOT webm). Sending
     # mp4 bytes named .wav made Groq fail the transcription (seen live
@@ -389,6 +393,39 @@ class H(BaseHTTPRequestHandler):
                 return self._json(502, {"error": "groq_error", "detail": str(e)[:300]})
             return self._json(200, {"text": text,
                                     "ms": round((time.time() - t0) * 1000)})
+
+        # Text-only reply: the call page shows the text immediately and
+        # streams speech sentence-by-sentence via /speak, so the first
+        # sound arrives after one short sentence of synthesis instead of
+        # after the whole reply (Piper on Railway's 0.1 CPU took ~5s for
+        # a full reply — the "خیلی کنده" complaint, 2026-11-15).
+        if self.path == "/reply_text":
+            if not groq_available():
+                return self._json(503, {"error": "groq_key_missing",
+                                        "hint": "no GROQ_API_KEY env var and no stored custom.groq connection"})
+            try:
+                data = json.loads(self._read())
+                text = (data.get("text") or "").strip()
+                history = data.get("history") or []
+                tool_call = data.get("tool_call")
+            except Exception:
+                return self._json(400, {"error": "bad json"})
+            if not text:
+                return self._json(400, {"error": "empty text"})
+            t0 = time.time()
+            try:
+                reply = groq_chat(text, history)
+            except HTTPError as e:
+                return self._json(502, {"error": "groq_error", "status": e.code,
+                                        "detail": e.read().decode(errors="replace")[:300]})
+            except Exception as e:
+                return self._json(502, {"error": "reply_failed", "detail": str(e)[:300]})
+            resp = {"reply": reply,
+                    "ms": round((time.time() - t0) * 1000)}
+            if isinstance(tool_call, dict):
+                _code, resp["tool_result"] = store_request(tool_call)
+            self._json(200, resp)
+            return
 
         if self.path == "/reply":
             if not groq_available():

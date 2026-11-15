@@ -61,9 +61,8 @@
   </div>
   <div id="log"></div>
   <p class="hint">یک بار «شروع تماس» را بزن؛ بعد لازم نیست دکمه‌ای را نگه داری — هر وقت حرف بزنی
-  گوش می‌دهد، وقتی ساکت شدی جواب می‌دهد، و وسط حرفش هم حرف بزنی ساکت می‌شود و گوش می‌دهد.
-  هر جواب چند ثانیه طول می‌کشد (ساخت صدا روی سرور رایگان کند است). اگر چیزی کار نکرد،
-  خطایش همین‌جا نوشته می‌شود.</p>
+  گوش می‌دهد، وقتی ساکت شدی جواب می‌دهد، و وسط حرفش هم حرف بزنی ساکت می‌شود و به حرفت گوش می‌دهد.
+  جواب‌ها کوتاه‌اند. اگر چیزی کار نکرد، خطایش همین‌جا نوشته می‌شود.</p>
   <div id="debug"></div>
 </div>
 <script>
@@ -73,14 +72,21 @@ const statusEl = $('status'), stateEl = $('state'), meterEl = $('meter'),
 const history = [];
 
 /* ---------- حالت مکالمه ---------- */
-let callActive = false, micStream = null, audioCtx = null, analyser = null, analyserData = null;
-let recorder = null, recChunks = [], recording = false, recMime = '';
+let callActive = false, callGen = 0;
+let micStream = null, audioCtx = null, analyser = null, analyserData = null;
+let recMime = '', feedMode = 'ring';           // ring = ضبط پیوسته + برش؛ utterance = ضبط به‌ازای هر جمله (اگر مرورگر timeslice ندهد)
+let feedRecorder = null, feedChunks = [], feedInit = null;
+let uttRecorder = null, uttChunks = [];
 let vadTimer = null, turnBusy = false, speaking = false;
-let lastSpeechAt = 0, speechStartAt = 0, overFrames = 0, bargeFrames = 0;
-let currentSource = null, currentAiEl = null, playGen = 0;
+let uttState = 'idle';                          // idle | talking
+let speechStartAt = 0, lastSpeechAt = 0, overFrames = 0, bargeFrames = 0, uttMaxRms = 0;
+let settleUntil = 0, playbackStartAt = 0;
+let currentSource = null, currentResolve = null, playGen = 0;
+let currentAiEl = null, lastAssistantReply = '';
+let pendingUtterance = null;                    // جمله‌ای که وسط فکرکردن/حرف‌زدن گفته شد
 
-const SPEAK_TH = 0.03, BARGE_TH = 0.08, SILENCE_MS = 1200,
-      MIN_SPEECH_MS = 400, MAX_UTT_MS = 30000;
+const SPEAK_TH = 0.03, BARGE_TH = 0.07, SILENCE_MS = 1000,
+      MIN_SPEECH_MS = 400, MAX_UTT_MS = 30000, PREROLL_MS = 800, SETTLE_MS = 300;
 
 function addMsg(cls, text) {
   const d = document.createElement('div');
@@ -100,13 +106,16 @@ async function refreshHealth() {
     if (h.groq_configured) {
       setStatus('متصل — کلید Groq هست، تماس زنده آماده‌ست.', 'ok');
       callBtn.disabled = false;
+      return true;
     } else {
       setStatus('سرور روشن است ولی کلید Groq نیست — شنیدن/جواب تا رسیدن کلید کار نمی‌کند.', 'bad');
       callBtn.disabled = true;
+      return false;
     }
   } catch (e) {
     setStatus('به سرور وصل نشدم — سرور خاموش است یا اینترنت قطع است.', 'bad');
     callBtn.disabled = true;
+    return false;
   }
 }
 
@@ -120,6 +129,10 @@ function pickMime() {
   }
   return '';
 }
+function makeRecorder() {
+  return recMime ? new MediaRecorder(micStream, { mimeType: recMime })
+                 : new MediaRecorder(micStream);
+}
 
 async function ensureAudioCtx() {
   if (!audioCtx) {
@@ -131,29 +144,37 @@ async function ensureAudioCtx() {
   return audioCtx;
 }
 
-/* ---------- پخش صدا از روی AudioContext (در iOS باید با لمس کاربر باز شده باشد) ---------- */
-async function playWavBytes(arrayBuffer) {
-  const ctx = await ensureAudioCtx();
-  let buf;
-  try { buf = await ctx.decodeAudioData(arrayBuffer.slice(0)); }
-  catch (e) { throw new Error('صدا رمزگشایی نشد: ' + e.message); }
-  const gen = ++playGen;
-  speaking = true;
-  setState('در حال صحبت… (برای قطع‌کردن، حرف بزن)');
-  await new Promise(res => {
+/* ---------- پخش صدا: جمله‌به‌جمله، با پیش‌خوانی جمله‌ی بعد ---------- */
+function splitSentences(text) {
+  const parts = String(text).match(/[^.!؟?…]+[.!؟?…]*/g) || [String(text)];
+  return parts.map(s => s.trim()).filter(Boolean);
+}
+async function fetchSpeakBuf(text) {
+  try {
+    const r = await fetch('/speak', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }) });
+    if (!r.ok) return null;
+    const ctx = await ensureAudioCtx();
+    return await ctx.decodeAudioData(await (await r.blob()).arrayBuffer());
+  } catch (e) { return null; }
+}
+function playBuffer(buf) {
+  const gen = playGen;
+  return new Promise(res => {
+    const ctx = audioCtx;
     const src = ctx.createBufferSource();
-    const gain = ctx.createGain();
-    gain.gain.value = 1.0;
-    src.buffer = buf; src.connect(gain); gain.connect(ctx.destination);
-    currentSource = src;
-    src.onended = () => { if (currentSource === src) currentSource = null; res(); };
+    src.buffer = buf; src.connect(ctx.destination);
+    currentSource = src; currentResolve = res;
+    if (!speaking) { speaking = true; playbackStartAt = Date.now(); setState('در حال صحبت… (برای قطع‌کردن، حرف بزن)'); }
+    src.onended = () => { if (currentSource === src) currentSource = null; if (currentResolve === res) currentResolve = null; res(); };
     try { src.start(); } catch (e) { res(); }
   });
-  if (gen === playGen) { speaking = false; }
 }
 function stopPlayback(mark) {
   playGen++;
   if (currentSource) { try { currentSource.stop(); } catch (e) {} try { currentSource.disconnect(); } catch (e) {} currentSource = null; }
+  if (currentResolve) { const r = currentResolve; currentResolve = null; r(); }
   speaking = false;
   if (mark && currentAiEl) {
     const s = document.createElement('span');
@@ -161,21 +182,75 @@ function stopPlayback(mark) {
     currentAiEl.appendChild(s); currentAiEl = null;
   }
 }
+async function speakStream(fullText, gen) {
+  const sentences = splitSentences(fullText);
+  if (!sentences.length) return false;
+  const myGen = ++playGen;
+  let playedAny = false, failedAll = true;
+  let nextP = fetchSpeakBuf(sentences[0]);
+  for (let i = 0; i < sentences.length; i++) {
+    if (myGen !== playGen || gen !== callGen) break;
+    const buf = await nextP;
+    if (myGen !== playGen || gen !== callGen) break;
+    nextP = (i + 1 < sentences.length) ? fetchSpeakBuf(sentences[i + 1]) : null;
+    if (!buf) continue;
+    failedAll = false;
+    await playBuffer(buf);
+    playedAny = true;
+    if (myGen !== playGen || gen !== callGen) break;
+  }
+  if (myGen === playGen) { speaking = false; settleUntil = Date.now() + SETTLE_MS; }
+  if (failedAll) showError('جواب رسید ولی هیچ جمله‌ای صدا نشد — سرور صدا را نساخت.');
+  return playedAny;
+}
 function b64ToBytes(b64) {
   const bin = atob(b64), out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out.buffer;
 }
+async function playB64Fallback(b64, gen) {
+  try {
+    const ctx = await ensureAudioCtx();
+    const buf = await ctx.decodeAudioData(b64ToBytes(b64));
+    const myGen = ++playGen;
+    await playBuffer(buf);
+    if (myGen === playGen) { speaking = false; settleUntil = Date.now() + SETTLE_MS; }
+  } catch (e) { showError('جواب رسید ولی پخش صدا نشد: ' + e.message); }
+}
 
-/* ---------- مکالمه: شنیدن → جواب ---------- */
-async function askReply(text) {
+/* ---------- تشخیص پژواک: صدای خود دستیار که از بلندگو برگشته ---------- */
+function normFa(s) {
+  return String(s).replace(/[\s.,!؟?،:؛«»"']/g, '').replace(/ي/g, 'ی').replace(/ك/g, 'ک');
+}
+function isEcho(text) {
+  if (!lastAssistantReply) return false;
+  const a = normFa(text), b = normFa(lastAssistantReply);
+  return a.length >= 8 && (b.indexOf(a) !== -1 || a.indexOf(b) !== -1);
+}
+
+/* ---------- مکالمه ---------- */
+async function askReply(text, gen) {
   addMsg('you', text);
   const waitEl = addMsg('sys', '…در حال فکر کردن');
   try {
-    const r = await fetch('/reply', { method: 'POST',
+    let r = await fetch('/reply_text', { method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text, history }) });
-    const data = await r.json().catch(() => ({}));
+    let data = await r.json().catch(() => ({}));
+    if (r.status === 404) {   // سرور قدیمی: برگرد به /reply که خودش صدا دارد
+      r = await fetch('/reply', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, history }) });
+      data = await r.json().catch(() => ({}));
+      waitEl.remove();
+      if (!r.ok) { showError('خطا از سرور (' + r.status + '): ' + (data.detail || data.error || 'نامشخص')); return; }
+      if (gen !== callGen) return;
+      history.push({ role: 'user', content: text }, { role: 'assistant', content: data.reply });
+      lastAssistantReply = data.reply;
+      currentAiEl = addMsg('ai', data.reply);
+      if (data.audio_b64) await playB64Fallback(data.audio_b64, gen);
+      return;
+    }
     waitEl.remove();
     if (!r.ok) {
       if (data.error === 'groq_key_missing')
@@ -184,28 +259,24 @@ async function askReply(text) {
         showError('خطا از سرور (' + r.status + '): ' + (data.detail || data.error || 'نامشخص'));
       return;
     }
+    if (gen !== callGen) return;
     history.push({ role: 'user', content: text }, { role: 'assistant', content: data.reply });
-    currentAiEl = addMsg('ai', data.reply + (data.ms ? '  (' + (data.ms / 1000).toFixed(1) + ' ثانیه)' : ''));
-    setDebug('reply ms=' + (data.ms || '?') + ' synth_ms=' + (data.synth_ms || '?') +
-             ' audio=' + (data.audio_b64 ? Math.round(data.audio_b64.length * 0.75 / 1024) + 'KB' : 'none'));
+    lastAssistantReply = data.reply;
+    currentAiEl = addMsg('ai', data.reply + (data.ms ? '  (' + (data.ms / 1000).toFixed(1) + ' ثانیه فکر)' : ''));
+    setDebug('reply_text ms=' + (data.ms || '?'));
     if (data.tool_result && data.tool_result.tracking_code) {
       addMsg('sys', (data.tool_result.duplicate
         ? 'این درخواست قبلاً ثبت شده بود — کد پیگیری: '
         : 'درخواست ثبت شد — کد پیگیری: ') + data.tool_result.tracking_code);
     }
-    if (data.audio_b64) {
-      try { await playWavBytes(b64ToBytes(data.audio_b64)); }
-      catch (e) { showError('جواب رسید ولی پخش صدا نشد: ' + e.message); }
-    } else {
-      showError('جواب رسید ولی فایل صدا همراهش نبود.');
-    }
+    await speakStream(data.reply, gen);
   } catch (e) {
     waitEl.remove();
     showError('ارتباط با سرور قطع شد: ' + e.message);
   }
 }
 
-async function sendAudio(blob) {
+async function runVoiceTurn(blob, gen) {
   turnBusy = true;
   setState('در حال شنیدن صدا…');
   const t0 = Date.now();
@@ -213,7 +284,8 @@ async function sendAudio(blob) {
     const r = await fetch('/transcribe', { method: 'POST', body: blob });
     const data = await r.json().catch(() => ({}));
     setDebug('transcribe: ' + blob.size + ' bytes, ' + (blob.type || 'no-type') +
-             ', ' + (Date.now() - t0) + 'ms -> ' + r.status);
+             ', ' + (Date.now() - t0) + 'ms -> ' + r.status + ' | mode=' + feedMode);
+    if (gen !== callGen) return;
     if (!r.ok) {
       if (data.error === 'groq_key_missing')
         showError('کلید Groq هنوز نرسیده — صدا شنیده نشد.');
@@ -222,47 +294,86 @@ async function sendAudio(blob) {
       return;
     }
     if (!data.text) { addMsg('sys', 'چیزی شنیده نشد — دوباره حرف بزن.'); return; }
-    await askReply(data.text);
+    if (isEcho(data.text)) { addMsg('sys', '(صدای خود دستیار بود — نادیده گرفته شد.)'); return; }
+    await askReply(data.text, gen);
   } catch (e) {
-    showError('ارتباط با سرور قطع شد: ' + e.message);
+    if (gen === callGen) showError('ارتباط با سرور قطع شد: ' + e.message);
   } finally {
     turnBusy = false;
-    if (callActive) setState('گوش می‌دهم… حرف بزن.');
+    if (gen === callGen && callActive) {
+      if (pendingUtterance) {
+        const p = pendingUtterance; pendingUtterance = null;
+        runVoiceTurn(p, gen);
+      } else {
+        setState('گوش می‌دهم… حرف بزن.');
+      }
+    }
   }
 }
 
-/* ---------- تشخیص گفتار (VAD) روی میکروفون ---------- */
+/* ---------- ضبط: بافر چرخان پیوسته (با پیش‌ضبط ۰٫۸ ثانیه) ---------- */
+function feedOnData(e) {
+  if (!e.data || !e.data.size) return;
+  const now = Date.now();
+  feedChunks.push({ t: now, data: e.data });
+  if (!feedInit) feedInit = e.data;
+  while (feedChunks.length > 140) feedChunks.splice(1, 1);   // ~۳۵ ثانیه، اولی (init) همیشه می‌ماند
+}
+function collectRingBlob(startT, endT) {
+  const parts = [];
+  for (const c of feedChunks) {
+    if (c.t >= startT && c.t <= endT) parts.push(c.data);
+  }
+  if (!parts.length) return null;
+  if (feedInit && parts[0] !== feedInit) parts.unshift(feedInit);
+  return new Blob(parts, { type: recMime || 'audio/mp4' });
+}
+function beginUtterance(now) {
+  uttState = 'talking';
+  speechStartAt = now; lastSpeechAt = now; uttMaxRms = 0;
+  setState('…در حال ضبط');
+  if (feedMode === 'utterance') {
+    try {
+      uttChunks = [];
+      uttRecorder = makeRecorder();
+      uttRecorder.ondataavailable = e => { if (e.data && e.data.size) uttChunks.push(e.data); };
+      uttRecorder.start(250);
+    } catch (e) { showError('شروع ضبط نشد: ' + e.message); uttState = 'idle'; }
+  }
+}
+function endUtterance(now) {
+  uttState = 'idle';
+  if (feedMode === 'ring') {
+    const blob = collectRingBlob(speechStartAt - PREROLL_MS, now);
+    if (blob && blob.size > 1500) queueUtterance(blob);
+    return;
+  }
+  // utterance mode: صبر کن ضبط واقعاً متوقف شود، بعد بفرست
+  const rec = uttRecorder; uttRecorder = null;
+  if (!rec) return;
+  rec.onstop = () => {
+    const type = rec.mimeType || recMime || 'audio/mp4';
+    const blob = new Blob(uttChunks, { type });
+    if (blob.size > 1500) queueUtterance(blob);
+  };
+  try { rec.stop(); } catch (e) {}
+}
+function queueUtterance(blob) {
+  if (!callActive) return;
+  if (turnBusy || speaking) {
+    if (!pendingUtterance) pendingUtterance = blob;   // فقط یک جمله در صف؛ بقیه دور ریخته می‌شود
+    return;
+  }
+  runVoiceTurn(blob, callGen);
+}
+
+/* ---------- تشخیص گفتار (VAD) ---------- */
 function micLevel() {
   if (!analyser) return 0;
   analyser.getFloatTimeDomainData(analyserData);
   let sum = 0;
   for (let i = 0; i < analyserData.length; i++) sum += analyserData[i] * analyserData[i];
   return Math.sqrt(sum / analyserData.length);
-}
-function startUtterance() {
-  try {
-    recChunks = [];
-    recorder = recMime ? new MediaRecorder(micStream, { mimeType: recMime })
-                       : new MediaRecorder(micStream);
-  } catch (e) {
-    try { recorder = new MediaRecorder(micStream); }
-    catch (e2) { showError('ضبط صدا در این مرورگر ممکن نشد: ' + e2.message); endCall(); return; }
-  }
-  recorder.ondataavailable = e => { if (e.data && e.data.size) recChunks.push(e.data); };
-  recorder.onstop = () => {
-    const type = recorder.mimeType || recMime || 'audio/webm';
-    sendAudio(new Blob(recChunks, { type }));
-  };
-  try { recorder.start(250); }
-  catch (e) { showError('شروع ضبط نشد: ' + e.message); return; }
-  recording = true;
-  speechStartAt = Date.now(); lastSpeechAt = speechStartAt;
-  setState('…در حال ضبط');
-}
-function stopUtterance() {
-  if (!recording || !recorder) return;
-  recording = false;
-  try { recorder.stop(); } catch (e) {}
 }
 function vadTick() {
   if (!callActive) return;
@@ -272,27 +383,35 @@ function vadTick() {
   meterEl.classList.toggle('hot', rms > SPEAK_TH);
   const now = Date.now();
   if (speaking) {
-    // وسط حرف دستیار: اگر کاربر واقعاً حرف زد، قطع کن و گوش بده
-    if (rms > BARGE_TH) { if (++bargeFrames >= 3) { bargeFrames = 0; stopPlayback(true); } }
-    else bargeFrames = 0;
+    // وسط حرف دستیار: اگر کاربر واقعاً حرف زد، فوری قطع کن و ضبط جمله‌اش را شروع کن
+    if (now - playbackStartAt > 400 && rms > BARGE_TH) {
+      if (++bargeFrames >= 2) {
+        bargeFrames = 0;
+        stopPlayback(true);
+        beginUtterance(now);   // در حالت ring، پیش‌ضبط ۰٫۸ ثانیه حرف اولش را هم دارد
+      }
+    } else if (rms <= BARGE_TH) bargeFrames = 0;
     return;
   }
-  if (turnBusy) return;
-  if (recording) {
+  if (now < settleUntil) return;   // مکث کوتاه بعد از تمام‌شدن صدا، تا پژواک بلندگو جمله نشود
+  if (uttState === 'talking') {
+    if (rms > uttMaxRms) uttMaxRms = rms;
     if (rms > SPEAK_TH) lastSpeechAt = now;
     if ((now - lastSpeechAt > SILENCE_MS && now - speechStartAt > MIN_SPEECH_MS) ||
-        now - speechStartAt > MAX_UTT_MS) stopUtterance();
-  } else {
-    if (rms > SPEAK_TH) { if (++overFrames >= 2) { overFrames = 0; startUtterance(); } }
-    else overFrames = 0;
+        now - speechStartAt > MAX_UTT_MS) endUtterance(now);
+    return;
   }
+  // idle: شروع جمله‌ی تازه (در حالت ring با ۲ فریم، چون پیش‌ضبط حرف اول را نگه داشته)
+  const need = feedMode === 'ring' ? 2 : 1;
+  if (rms > SPEAK_TH) { if (++overFrames >= need) { overFrames = 0; beginUtterance(now); } }
+  else overFrames = 0;
 }
 
 /* ---------- شروع / قطع تماس ---------- */
 async function startCall() {
   callBtn.disabled = true;
   try {
-    await refreshHealth();
+    if (!(await refreshHealth())) { callBtn.disabled = false; return; }
     await ensureAudioCtx();   // بازکردن صدا باید داخل همین لمس انجام شود (iOS)
     if (typeof navigator === 'undefined' || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
       throw new Error('این مرورگر به میکروفون دسترسی نمی‌دهد.');
@@ -306,8 +425,27 @@ async function startCall() {
     src.connect(analyser);
     recMime = pickMime();
     if (recMime === null) throw new Error('این مرورگر ضبط صدا (MediaRecorder) ندارد.');
-    setDebug('recorder mime: ' + (recMime || '(default)'));
+    // ضبط پیوسته با برش‌های ۲۵۰ میلی‌ثانیه‌ای؛ اگر مرورگر timeslice را ندهد،
+    // بعد از ۲ ثانیه به حالت «ضبط به‌ازای هر جمله» برمی‌گردیم.
+    feedMode = 'ring'; feedChunks = []; feedInit = null;
+    feedRecorder = makeRecorder();
+    feedRecorder.ondataavailable = feedOnData;
+    feedRecorder.start(250);
+    setTimeout(() => {
+      if (!callActive) return;
+      if (feedChunks.length < 4) {
+        feedMode = 'utterance';
+        try { feedRecorder.stop(); } catch (e) {}
+        feedRecorder = null;
+        setDebug('recorder mime: ' + (recMime || '(default)') + ' | mode=utterance (no timeslice)');
+      } else {
+        setDebug('recorder mime: ' + (recMime || '(default)') + ' | mode=ring');
+      }
+    }, 2000);
+    setDebug('recorder mime: ' + (recMime || '(default)') + ' | detecting mode…');
+    callGen++;
     callActive = true;
+    pendingUtterance = null;
     vadTimer = setInterval(vadTick, 100);
     setState('گوش می‌دهم… حرف بزن.');
     callBtn.textContent = '📵 قطع تماس';
@@ -325,11 +463,14 @@ async function startCall() {
   }
 }
 function endCall() {
+  callGen++;   // همه‌ی نوبت‌های در حال انجام باطل می‌شوند
   callActive = false;
   if (vadTimer) { clearInterval(vadTimer); vadTimer = null; }
-  if (recording) { try { recorder.stop(); } catch (e) {} recording = false; }
+  uttState = 'idle';
+  if (feedRecorder) { try { feedRecorder.stop(); } catch (e) {} feedRecorder = null; }
+  if (uttRecorder) { try { uttRecorder.onstop = null; uttRecorder.stop(); } catch (e) {} uttRecorder = null; }
   stopPlayback(false);
-  turnBusy = false;
+  turnBusy = false; pendingUtterance = null;
   if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
   analyser = null;
   meterEl.style.width = '0%';
@@ -343,11 +484,11 @@ callBtn.addEventListener('click', () => { callActive ? endCall() : startCall(); 
 testBtn.addEventListener('click', async () => {
   testBtn.disabled = true;
   try {
-    const r = await fetch('/speak', { method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: 'سلام، صدای من را می‌شنوید؟ من منشی فروشگاه دوخت نیلا هستم.' }) });
-    if (!r.ok) throw new Error('سرور صدا را نساخت (' + r.status + ').');
-    await playWavBytes(await (await r.blob()).arrayBuffer());
+    const buf = await fetchSpeakBuf('سلام، صدای من را می‌شنوید؟ من منشی فروشگاه دوخت نیلا هستم.');
+    if (!buf) throw new Error('سرور صدا را نساخت.');
+    const myGen = ++playGen;
+    await playBuffer(buf);
+    if (myGen === playGen) speaking = false;
     addMsg('sys', 'آزمایش صدا پخش شد — اگر نشنیدی، صدای گوشی را بلند کن.');
   } catch (e) {
     showError('آزمایش صدا نشد: ' + e.message);
@@ -363,7 +504,10 @@ async function sendText() {
   $('text').value = '';
   if (speaking) stopPlayback(true);
   await ensureAudioCtx().catch(() => {});
-  askReply(t);
+  if (turnBusy) { addMsg('sys', 'صبر کن نوبت فعلی تمام شود…'); return; }
+  turnBusy = true;
+  try { await askReply(t, callGen); }
+  finally { turnBusy = false; }
 }
 $('send').addEventListener('click', sendText);
 $('text').addEventListener('keydown', e => { if (e.key === 'Enter') sendText(); });
